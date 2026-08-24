@@ -1,0 +1,1 @@
+ALTER TABLE `products` ADD `sku_values_json` text DEFAULT '[]' NOT NULL;

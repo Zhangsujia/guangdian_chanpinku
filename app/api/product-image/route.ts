@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { getSessionMember, isSameOrigin } from "../../auth";
+import { canEditProducts, getSessionMember, isSameOrigin } from "../../auth";
 
 const ACCEPTED_TYPES = new Map([
   ["image/jpeg", "jpg"],
@@ -56,6 +56,7 @@ export async function POST(request: Request) {
     const member = await getSessionMember(request);
     if (!member) return error("登录已失效，请重新登录", 401);
     if (member.mustChangePassword) return error("请先修改临时密码", 403);
+    if (!canEditProducts(member)) return error("管理员未开放产品编辑权限", 403);
     const form = await request.formData();
     const productId = String(form.get("productId") ?? "").trim();
     const file = form.get("image");
@@ -88,6 +89,7 @@ export async function DELETE(request: Request) {
     const member = await getSessionMember(request);
     if (!member) return error("登录已失效，请重新登录", 401);
     if (member.mustChangePassword) return error("请先修改临时密码", 403);
+    if (!canEditProducts(member)) return error("管理员未开放产品编辑权限", 403);
     const productId = new URL(request.url).searchParams.get("productId")?.trim() ?? "";
     const product = productId ? await productImage(env.DB, productId) : null;
     if (!product || product.deletedAt) return error("产品不存在", 404);

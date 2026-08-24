@@ -5,7 +5,6 @@ export const PRODUCT_STATUSES: ProductStatus[] = ["正常推广", "暂停推广"
 
 export type ReportLink = {
   platform: string;
-  commission: number;
   status: string;
   updatedAt: string;
   lastCheckedAt?: string;
@@ -15,6 +14,7 @@ export type ReportProduct = {
   id: string;
   name: string;
   status: ProductStatus;
+  commission: number;
   links: ReportLink[];
 };
 
@@ -45,7 +45,7 @@ function validTime(value?: string) {
   return Number.isFinite(time) ? time : 0;
 }
 
-/** Link freshness is refreshed by either an actual link/commission update or a link check. */
+/** Link freshness is refreshed by an actual link update or a link check. */
 export function staleLinkDays(link: Pick<ReportLink, "updatedAt" | "lastCheckedAt">, now = new Date()) {
   const freshness = Math.max(validTime(link.updatedAt), validTime(link.lastCheckedAt));
   if (!freshness) return 0;
@@ -86,7 +86,7 @@ export function buildProductReport(products: ReportProduct[], activity: ReportAc
   const problemLinks = allLinks.filter(({ link }) => link.status !== "有效");
   const staleLinks = allLinks.map((item) => ({ ...item, days: staleLinkDays(item.link, now) })).filter((item) => item.days > 7);
   const staleProducts = [...new Set(staleLinks.map((item) => item.product.id))].length;
-  const lowCommissionProducts = [...new Set(allLinks.filter(({ link }) => Number.isFinite(link.commission) && link.commission < 30).map(({ product }) => product.id))].length;
+  const lowCommissionProducts = products.filter((product) => Number.isFinite(product.commission) && product.commission < 30).length;
   const actions = (name: string) => recentActivity.filter((item) => item.action === name).length;
   const changes = recentActivity.slice(0, 8).map((item) => `${item.productName || "团队资料"}：${item.summary}`);
 

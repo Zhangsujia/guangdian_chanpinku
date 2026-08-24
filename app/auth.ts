@@ -5,6 +5,8 @@ export type AuthMember = {
   displayName: string;
   role: "admin" | "member";
   active: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
   mustChangePassword: boolean;
   createdAt: string;
 };
@@ -116,6 +118,7 @@ export async function getSessionMember(request: Request): Promise<AuthMember | n
   const now = new Date().toISOString();
   const row = await env.DB.prepare(
     `SELECT m.email, m.display_name AS displayName, m.role, m.active,
+      m.can_edit AS canEdit, m.can_delete AS canDelete,
       m.must_change_password AS mustChangePassword, m.created_at AS createdAt
      FROM sessions s JOIN members m ON m.email = s.member_email
      WHERE s.token_hash = ? AND s.expires_at > ? AND m.active = 1`,
@@ -126,9 +129,19 @@ export async function getSessionMember(request: Request): Promise<AuthMember | n
     displayName: String(row.displayName),
     role: String(row.role) as AuthMember["role"],
     active: Boolean(row.active),
+    canEdit: String(row.role) === "admin" || Boolean(row.canEdit),
+    canDelete: String(row.role) === "admin" || Boolean(row.canDelete),
     mustChangePassword: Boolean(row.mustChangePassword),
     createdAt: String(row.createdAt),
   };
+}
+
+export function canEditProducts(member: AuthMember) {
+  return member.role === "admin" || member.canEdit;
+}
+
+export function canDeleteProducts(member: AuthMember) {
+  return member.role === "admin" || member.canDelete;
 }
 
 export function isSameOrigin(request: Request) {

@@ -1,8 +1,9 @@
 import { env } from "cloudflare:workers";
-import { getSessionMember, hashPassword, isSameOrigin, validatePassword } from "../../auth";
+import { canDeleteProducts, canEditProducts, getSessionMember, hashPassword, isSameOrigin, validatePassword } from "../../auth";
 
 type Role = "admin" | "member";
 type LinkStatus = "有效" | "待复核" | "疑似失效" | "已失效";
+type LinkMode = "shared" | "creator";
 type ProductStatus = "正常推广" | "暂停推广" | "已下架";
 
 type Member = {
@@ -10,6 +11,8 @@ type Member = {
   displayName: string;
   role: Role;
   active: boolean;
+  canEdit: boolean;
+  canDelete: boolean;
   mustChangePassword: boolean;
   createdAt: string;
 };
@@ -17,7 +20,17 @@ type Member = {
 type ProductLink = {
   id: string;
   platform: string;
+  linkMode: LinkMode;
   url: string;
+  creatorLinks: Array<{
+    id: string;
+    creatorName: string;
+    url: string;
+    status: LinkStatus;
+    lastCheckedAt?: string;
+    checkNote?: string;
+    updatedAt: string;
+  }>;
   mechanism: string;
   commission: number;
   status: LinkStatus;
@@ -34,11 +47,20 @@ type ProductPackage = {
   updatedAt: string;
 };
 
+type ProductSku = {
+  value: string;
+  price: number | null;
+};
+
 type Product = {
   id: string;
   name: string;
   manufacturer: string;
+  sku: string;
+  skus: ProductSku[];
   price: number;
+  mechanism: string;
+  commission: number;
   status: ProductStatus;
   imageUrl: string;
   aliases: string[];
@@ -84,20 +106,67 @@ function safeJsonArray(value: unknown) {
   }
 }
 
+function safeSkuArray(value: unknown, legacy = ""): ProductSku[] {
+  try {
+    const parsed = JSON.parse(String(value ?? "[]"));
+    const source = Array.isArray(parsed) ? parsed : [];
+    const seen = new Set<string>();
+    const entries = source.map((item) => {
+      const object = item && typeof item === "object" ? item as Record<string, unknown> : null;
+      const skuValue = String(object?.value ?? object?.sku ?? object?.name ?? item ?? "").trim();
+      const rawPrice = object?.price;
+      const numericPrice = rawPrice === null || rawPrice === undefined || rawPrice === "" ? null : Number(rawPrice);
+      return { value: skuValue, price: numericPrice !== null && Number.isFinite(numericPrice) && numericPrice > 0 ? numericPrice : null };
+    }).filter((item) => {
+      const key = normalizeName(item.value);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (entries.length) return entries;
+  } catch {
+    // Fall through to the legacy single-SKU value.
+  }
+  const fallback = legacy.trim();
+  return fallback ? [{ value: fallback, price: null }] : [];
+}
+
+function safeCreatorLinks(value: unknown, fallbackUpdatedAt = "") {
+  try {
+    const parsed = JSON.parse(String(value ?? "[]"));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => {
+      const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const status = VALID_STATUSES.has(String(row.status) as LinkStatus) ? String(row.status) as LinkStatus : "有效";
+      return {
+        id: String(row.id || id("creator")),
+        creatorName: String(row.creatorName ?? row.creator ?? row.name ?? "").trim(),
+        url: String(row.url ?? row.value ?? "").trim(),
+        status,
+        lastCheckedAt: row.lastCheckedAt ? String(row.lastCheckedAt) : undefined,
+        checkNote: row.checkNote ? String(row.checkNote) : undefined,
+        updatedAt: String(row.updatedAt ?? fallbackUpdatedAt),
+      };
+    }).filter((item) => item.creatorName && item.url);
+  } catch {
+    return [];
+  }
+}
+
 function error(message: string, status = 400, code?: string) {
   return Response.json({ error: message, code }, { status });
 }
 
 async function loadProduct(db: D1Database, productId: string) {
   const row = await db.prepare(
-    `SELECT id, name, manufacturer, price, promotion_status AS status, image_key AS imageKey, aliases_json AS aliasesJson, notes, revision,
+    `SELECT id, name, manufacturer, sku, sku_values_json AS skuValuesJson, price, mechanism, commission, promotion_status AS status, image_key AS imageKey, aliases_json AS aliasesJson, notes, revision,
       created_by AS createdBy, updated_by AS updatedBy, deleted_at AS deletedAt,
       deleted_by AS deletedBy, created_at AS createdAt, updated_at AS updatedAt
       FROM products WHERE id = ?`,
   ).bind(productId).first<Record<string, unknown>>();
   if (!row) return null;
   const links = await db.prepare(
-    `SELECT id, platform, url, mechanism, commission, status, last_checked_at AS lastCheckedAt,
+    `SELECT id, platform, link_mode AS linkMode, url, creator_links_json AS creatorLinksJson, mechanism, commission, status, last_checked_at AS lastCheckedAt,
       check_note AS checkNote, updated_at AS updatedAt FROM product_links
       WHERE product_id = ? ORDER BY platform, created_at`,
   ).bind(productId).all<Record<string, unknown>>();
@@ -109,11 +178,19 @@ async function loadProduct(db: D1Database, productId: string) {
 }
 
 function mapProduct(row: Record<string, unknown>, links: Array<Record<string, unknown>>, packages: Array<Record<string, unknown>>): Product {
+  const legacySku = String(row.sku ?? "").trim();
+  const skus = safeSkuArray(row.skuValuesJson, legacySku);
+  const mechanism = String(row.mechanism ?? links[0]?.mechanism ?? "").trim();
+  const commission = Number(row.commission ?? links[0]?.commission ?? 0);
   return {
     id: String(row.id),
     name: String(row.name),
     manufacturer: String(row.manufacturer ?? "未填写"),
+    sku: skus[0]?.value ?? "",
+    skus,
     price: Number(row.price ?? 0),
+    mechanism,
+    commission,
     status: VALID_PRODUCT_STATUSES.has(String(row.status) as ProductStatus) ? String(row.status) as ProductStatus : "正常推广",
     imageUrl: row.imageKey ? `/api/product-image?productId=${encodeURIComponent(String(row.id))}&v=${encodeURIComponent(String(row.updatedAt ?? ""))}` : "",
     aliases: safeJsonArray(row.aliasesJson),
@@ -135,9 +212,11 @@ function mapProduct(row: Record<string, unknown>, links: Array<Record<string, un
     links: links.map((link) => ({
       id: String(link.id),
       platform: String(link.platform),
+      linkMode: String(link.linkMode) === "creator" ? "creator" : "shared",
       url: String(link.url),
-      mechanism: String(link.mechanism),
-      commission: Number(link.commission),
+      creatorLinks: safeCreatorLinks(link.creatorLinksJson, String(link.updatedAt ?? row.updatedAt)),
+      mechanism,
+      commission,
       status: String(link.status) as LinkStatus,
       lastCheckedAt: link.lastCheckedAt ? String(link.lastCheckedAt) : undefined,
       checkNote: link.checkNote ? String(link.checkNote) : undefined,
@@ -149,13 +228,13 @@ function mapProduct(row: Record<string, unknown>, links: Array<Record<string, un
 async function readState(db: D1Database, member: Member) {
   const [productResult, linkResult, packageResult, memberResult, activityResult, trashResult, teamResult] = await db.batch([
     db.prepare(
-      `SELECT id, name, manufacturer, price, promotion_status AS status, image_key AS imageKey, aliases_json AS aliasesJson, notes, revision,
+      `SELECT id, name, manufacturer, sku, sku_values_json AS skuValuesJson, price, mechanism, commission, promotion_status AS status, image_key AS imageKey, aliases_json AS aliasesJson, notes, revision,
         created_by AS createdBy, updated_by AS updatedBy, deleted_at AS deletedAt,
         deleted_by AS deletedBy, created_at AS createdAt, updated_at AS updatedAt
         FROM products WHERE deleted_at IS NULL ORDER BY updated_at DESC`,
     ),
     db.prepare(
-      `SELECT id, product_id AS productId, platform, url, mechanism, commission, status,
+      `SELECT id, product_id AS productId, platform, link_mode AS linkMode, url, creator_links_json AS creatorLinksJson, mechanism, commission, status,
         last_checked_at AS lastCheckedAt, check_note AS checkNote, updated_at AS updatedAt
         FROM product_links ORDER BY platform, created_at`,
     ),
@@ -164,7 +243,7 @@ async function readState(db: D1Database, member: Member) {
         FROM product_packages ORDER BY created_at, name`,
     ),
     db.prepare(
-      `SELECT email, display_name AS displayName, role, active,
+      `SELECT email, display_name AS displayName, role, active, can_edit AS canEdit, can_delete AS canDelete,
        must_change_password AS mustChangePassword, created_at AS createdAt
        FROM members ORDER BY role, created_at`,
     ),
@@ -175,7 +254,7 @@ async function readState(db: D1Database, member: Member) {
        FROM activity_logs ORDER BY created_at DESC LIMIT 300`,
     ),
     db.prepare(
-      `SELECT id, name, manufacturer, price, promotion_status AS status, image_key AS imageKey, aliases_json AS aliasesJson, notes, revision,
+      `SELECT id, name, manufacturer, sku, sku_values_json AS skuValuesJson, price, mechanism, commission, promotion_status AS status, image_key AS imageKey, aliases_json AS aliasesJson, notes, revision,
         created_by AS createdBy, updated_by AS updatedBy, deleted_at AS deletedAt,
         deleted_by AS deletedBy, created_at AS createdAt, updated_at AS updatedAt
         FROM products WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT 100`,
@@ -200,7 +279,7 @@ async function readState(db: D1Database, member: Member) {
   });
   const products = ((productResult.results ?? []) as Array<Record<string, unknown>>)
     .map((row) => mapProduct(row, byProduct.get(String(row.id)) ?? [], packagesByProduct.get(String(row.id)) ?? []));
-  const trash = member.role === "admin"
+  const trash = canDeleteProducts(member)
     ? ((trashResult.results ?? []) as Array<Record<string, unknown>>).map((row) => mapProduct(row, byProduct.get(String(row.id)) ?? [], packagesByProduct.get(String(row.id)) ?? []))
     : [];
   const teamRow = (teamResult.results?.[0] ?? {}) as Record<string, unknown>;
@@ -217,7 +296,13 @@ async function readState(db: D1Database, member: Member) {
     team,
     products,
     trash,
-    members: member.role === "admin" ? memberResult.results ?? [] : [member],
+    members: member.role === "admin"
+      ? ((memberResult.results ?? []) as Array<Record<string, unknown>>).map((item) => ({
+          ...item,
+          canEdit: String(item.role) === "admin" || Boolean(item.canEdit),
+          canDelete: String(item.role) === "admin" || Boolean(item.canDelete),
+        }))
+      : [member],
     activity: activityResult.results ?? [],
     user: member,
     syncedAt: new Date().toISOString(),
@@ -229,6 +314,22 @@ function validateProduct(input: unknown): { product?: Product; message?: string 
   const product = input as Product;
   if (!String(product.id ?? "").trim() || !String(product.name ?? "").trim()) return { message: "产品名称不能为空" };
   if (typeof product.price !== "number" || !Number.isFinite(product.price) || product.price <= 0 || product.price > 99999999) return { message: "单品价格格式不正确" };
+  product.mechanism = String(product.mechanism ?? product.links?.[0]?.mechanism ?? "").trim();
+  if (!product.mechanism) return { message: "产品机制不能为空" };
+  product.commission = Number(product.commission ?? product.links?.[0]?.commission);
+  if (!Number.isFinite(product.commission) || product.commission < 0 || product.commission > 100) return { message: "佣金必须是0%到100%之间的百分比" };
+  const rawSkus = Array.isArray(product.skus) ? product.skus : [product.sku];
+  product.skus = [...new Map(rawSkus.map((item) => {
+    const object = item && typeof item === "object" ? item as unknown as Record<string, unknown> : null;
+    const value = String(object?.value ?? object?.sku ?? object?.name ?? item ?? "").trim();
+    const rawPrice = object?.price;
+    const price = rawPrice === null || rawPrice === undefined || rawPrice === "" ? null : Number(rawPrice);
+    return [normalizeName(value), { value, price }] as const;
+  }).filter(([key]) => Boolean(key))).values()];
+  if (product.skus.length > 30) return { message: "一款产品最多添加30个SKU / 规格" };
+  if (product.skus.some((item) => item.value.length > 120)) return { message: "每个SKU / 产品规格不能超过120个字" };
+  if (product.skus.some((item) => item.price !== null && (!Number.isFinite(item.price) || item.price <= 0 || item.price > 99999999))) return { message: "SKU / 规格价格格式不正确" };
+  product.sku = product.skus[0]?.value ?? "";
   if (!VALID_PRODUCT_STATUSES.has(product.status)) product.status = "正常推广";
   if (!Array.isArray(product.packages)) product.packages = [];
   const packageNames = new Set<string>();
@@ -245,14 +346,36 @@ function validateProduct(input: unknown): { product?: Product; message?: string 
   if (!Array.isArray(product.links) || product.links.length === 0) return { message: "至少需要一条平台链接" };
   const urls = new Set<string>();
   for (const link of product.links) {
-    if (!String(link.url ?? "").trim()) return { message: `${link.platform || "平台"}链接不能为空` };
-    const url = String(link.url).trim();
-    if (urls.has(url)) return { message: "同一款产品中不能填写重复链接" };
-    urls.add(url);
-    if (!String(link.mechanism ?? "").trim()) return { message: `${link.platform || "平台"}的产品机制不能为空` };
-    if (typeof link.commission !== "number" || !Number.isFinite(link.commission) || link.commission < 0 || link.commission > 100) {
-      return { message: `${link.platform || "平台"}的佣金必须是0%到100%之间的百分比` };
+    link.linkMode = link.linkMode === "creator" ? "creator" : "shared";
+    link.creatorLinks = Array.isArray(link.creatorLinks) ? link.creatorLinks : [];
+    if (link.linkMode === "shared") {
+      if (!String(link.url ?? "").trim()) return { message: `${link.platform || "平台"}的统一链接不能为空` };
+      link.url = String(link.url).trim();
+      link.creatorLinks = [];
+      if (urls.has(link.url)) return { message: "同一款产品中不能填写重复链接" };
+      urls.add(link.url);
+    } else {
+      link.url = "";
+      if (!link.creatorLinks.length) return { message: `${link.platform || "平台"}至少需要一位达人的姓名和链接` };
+      if (link.creatorLinks.length > 100) return { message: `${link.platform || "平台"}最多添加100位达人` };
+      const creatorNames = new Set<string>();
+      for (const creator of link.creatorLinks) {
+        creator.id = String(creator.id || id("creator"));
+        creator.creatorName = String(creator.creatorName ?? "").trim();
+        creator.url = String(creator.url ?? "").trim();
+        if (!creator.creatorName || !creator.url) return { message: `${link.platform || "平台"}的达人姓名和链接需要填写完整` };
+        if (creator.creatorName.length > 50) return { message: "达人姓名不能超过50个字" };
+        const creatorKey = normalizeName(creator.creatorName);
+        if (creatorNames.has(creatorKey)) return { message: `${link.platform || "平台"}中存在重复达人“${creator.creatorName}”` };
+        creatorNames.add(creatorKey);
+        if (urls.has(creator.url)) return { message: "同一款产品中不能填写重复链接" };
+        urls.add(creator.url);
+        if (!VALID_STATUSES.has(creator.status)) creator.status = "有效";
+        creator.updatedAt = creator.updatedAt || new Date().toISOString();
+      }
     }
+    link.mechanism = product.mechanism;
+    link.commission = product.commission;
     if (!VALID_STATUSES.has(link.status)) link.status = "有效";
   }
   return { product };
@@ -321,6 +444,7 @@ export async function POST(request: Request) {
     }
 
     if (action === "save_product") {
+      if (!canEditProducts(member)) return error("管理员未开放产品新增和编辑权限", 403, "EDIT_PERMISSION_REQUIRED");
       const validation = validateProduct(payload.product);
       if (!validation.product) return error(validation.message ?? "产品资料不完整");
       const product = validation.product;
@@ -342,30 +466,33 @@ export async function POST(request: Request) {
           "DUPLICATE_PRODUCT",
         );
       }
-      for (const link of product.links) {
-        const duplicateLink = await db.prepare(
-          `SELECT p.id AS productId, p.name, pl.platform FROM product_links pl
-           JOIN products p ON p.id = pl.product_id
-           WHERE trim(pl.url) = ? AND p.deleted_at IS NULL AND p.id <> ? LIMIT 1`,
-        ).bind(link.url.trim(), product.id).first<Record<string, unknown>>();
-        if (duplicateLink) {
-          return error(`该链接已用于“${String(duplicateLink.name)}”的${String(duplicateLink.platform || "其他")}平台`, 409, "DUPLICATE_LINK");
-        }
+      const candidateUrls = new Set(product.links.flatMap((link) => link.linkMode === "creator" ? link.creatorLinks.map((item) => item.url.trim()) : [link.url.trim()]));
+      const savedLinkRows = await db.prepare(
+        `SELECT p.id AS productId, p.name, pl.platform, pl.url, pl.creator_links_json AS creatorLinksJson
+         FROM product_links pl JOIN products p ON p.id = pl.product_id
+         WHERE p.deleted_at IS NULL AND p.id <> ?`,
+      ).bind(product.id).all<Record<string, unknown>>();
+      const duplicateLink = (savedLinkRows.results ?? []).find((row) => {
+        if (candidateUrls.has(String(row.url ?? "").trim())) return true;
+        return safeCreatorLinks(row.creatorLinksJson).some((item) => candidateUrls.has(item.url));
+      });
+      if (duplicateLink) {
+        return error(`该链接已用于“${String(duplicateLink.name)}”的${String(duplicateLink.platform || "其他")}平台`, 409, "DUPLICATE_LINK");
       }
       const nextRevision = before ? before.revision + 1 : 1;
       const statements: D1PreparedStatement[] = [];
       if (before) {
         statements.push(db.prepare(
-          `UPDATE products SET name = ?, normalized_name = ?, manufacturer = ?, price = ?, promotion_status = ?, aliases_json = ?, notes = ?,
+          `UPDATE products SET name = ?, normalized_name = ?, manufacturer = ?, sku = ?, sku_values_json = ?, price = ?, mechanism = ?, commission = ?, promotion_status = ?, aliases_json = ?, notes = ?,
            revision = ?, updated_by = ?, updated_at = ? WHERE id = ?`,
-        ).bind(product.name.trim(), normalizeName(product.name), product.manufacturer?.trim() || "未填写", product.price, product.status, JSON.stringify(product.aliases ?? []), product.notes ?? "", nextRevision, member.email, now, product.id));
+        ).bind(product.name.trim(), normalizeName(product.name), product.manufacturer?.trim() || "未填写", product.sku, JSON.stringify(product.skus), product.price, product.mechanism, product.commission, product.status, JSON.stringify(product.aliases ?? []), product.notes ?? "", nextRevision, member.email, now, product.id));
         statements.push(db.prepare("DELETE FROM product_links WHERE product_id = ?").bind(product.id));
         statements.push(db.prepare("DELETE FROM product_packages WHERE product_id = ?").bind(product.id));
       } else {
         statements.push(db.prepare(
-          `INSERT INTO products (id, name, normalized_name, manufacturer, price, promotion_status, aliases_json, notes, revision, created_by, updated_by, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
-        ).bind(product.id, product.name.trim(), normalizeName(product.name), product.manufacturer?.trim() || "未填写", product.price, product.status, JSON.stringify(product.aliases ?? []), product.notes ?? "", member.email, member.email, now, now));
+          `INSERT INTO products (id, name, normalized_name, manufacturer, sku, sku_values_json, price, mechanism, commission, promotion_status, aliases_json, notes, revision, created_by, updated_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+        ).bind(product.id, product.name.trim(), normalizeName(product.name), product.manufacturer?.trim() || "未填写", product.sku, JSON.stringify(product.skus), product.price, product.mechanism, product.commission, product.status, JSON.stringify(product.aliases ?? []), product.notes ?? "", member.email, member.email, now, now));
       }
       for (const item of product.packages) {
         statements.push(db.prepare(
@@ -375,9 +502,9 @@ export async function POST(request: Request) {
       }
       for (const link of product.links) {
         statements.push(db.prepare(
-          `INSERT INTO product_links (id, product_id, platform, url, mechanism, commission, status, last_checked_at, check_note, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(link.id || id("link"), product.id, link.platform || "其他", link.url.trim(), link.mechanism.trim(), link.commission, link.status, link.lastCheckedAt ?? null, link.checkNote ?? null, link.updatedAt || now, link.updatedAt || now));
+          `INSERT INTO product_links (id, product_id, platform, link_mode, url, creator_links_json, mechanism, commission, status, last_checked_at, check_note, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(link.id || id("link"), product.id, link.platform || "其他", link.linkMode, link.url.trim(), JSON.stringify(link.creatorLinks), link.mechanism.trim(), link.commission, link.status, link.lastCheckedAt ?? null, link.checkNote ?? null, link.updatedAt || now, link.updatedAt || now));
       }
       const after = { ...product, revision: nextRevision, updatedBy: member.email, updatedAt: now };
       statements.push(await writeLog(db, {
@@ -397,7 +524,7 @@ export async function POST(request: Request) {
     }
 
     if (action === "delete_product") {
-      if (member.role !== "admin") return error("只有管理员可以删除产品", 403, "ADMIN_REQUIRED");
+      if (!canDeleteProducts(member)) return error("管理员未开放产品删除权限", 403, "DELETE_PERMISSION_REQUIRED");
       const productId = String(payload.productId ?? "");
       const before = await loadProduct(db, productId);
       if (!before) return error("产品不存在", 404);
@@ -409,7 +536,7 @@ export async function POST(request: Request) {
     }
 
     if (action === "restore_product") {
-      if (member.role !== "admin") return error("只有管理员可以恢复产品", 403, "ADMIN_REQUIRED");
+      if (!canDeleteProducts(member)) return error("管理员未开放产品删除与恢复权限", 403, "DELETE_PERMISSION_REQUIRED");
       const productId = String(payload.productId ?? "");
       const before = await loadProduct(db, productId);
       if (!before) return error("产品不存在", 404);
@@ -431,15 +558,39 @@ export async function POST(request: Request) {
       const credential = await hashPassword(temporaryPassword);
       await db.batch([
         db.prepare(
-          `INSERT INTO members (email, display_name, role, active, password_hash, password_salt, must_change_password,
+          `INSERT INTO members (email, display_name, role, active, can_edit, can_delete, password_hash, password_salt, must_change_password,
             failed_login_count, locked_until, invited_by, created_at, updated_at)
-           VALUES (?, ?, 'member', 1, ?, ?, 1, 0, NULL, ?, ?, ?)
+           VALUES (?, ?, 'member', 1, 1, 0, ?, ?, 1, 0, NULL, ?, ?, ?)
            ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name, role = 'member', active = 1,
             password_hash = excluded.password_hash, password_salt = excluded.password_salt, must_change_password = 1,
-            failed_login_count = 0, locked_until = NULL, invited_by = excluded.invited_by, updated_at = excluded.updated_at`,
+            can_edit = 1, can_delete = 0, failed_login_count = 0, locked_until = NULL,
+            invited_by = excluded.invited_by, updated_at = excluded.updated_at`,
         ).bind(email, displayName, credential.hash, credential.salt, member.email, now, now),
         db.prepare("DELETE FROM sessions WHERE member_email = ?").bind(email),
         await writeLog(db, { actor: member.email, action: "add_member", entityType: "member", entityId: email, summary: `添加团队成员 ${displayName}` }),
+      ]);
+      return Response.json({ ok: true });
+    }
+
+    if (action === "update_member_permissions") {
+      if (member.role !== "admin") return error("只有管理员可以修改成员权限", 403, "ADMIN_REQUIRED");
+      const email = String(payload.email ?? "").trim().toLowerCase();
+      const target = await db.prepare("SELECT email, display_name AS displayName, role, active FROM members WHERE email = ?")
+        .bind(email).first<Record<string, unknown>>();
+      if (!target || !Boolean(target.active)) return error("团队成员不存在或已停用", 404);
+      if (String(target.role) !== "member") return error("管理员权限不能在这里修改");
+      const canEdit = Boolean(payload.canEdit);
+      const canDelete = Boolean(payload.canDelete);
+      await db.batch([
+        db.prepare("UPDATE members SET can_edit = ?, can_delete = ?, updated_at = ? WHERE email = ? AND role = 'member'")
+          .bind(canEdit ? 1 : 0, canDelete ? 1 : 0, now, email),
+        await writeLog(db, {
+          actor: member.email,
+          action: "update_member_permissions",
+          entityType: "member",
+          entityId: email,
+          summary: `更新了 ${String(target.displayName || email)} 的权限：${canEdit ? "可新增编辑" : "仅查看"}、${canDelete ? "可删除恢复" : "不可删除"}`,
+        }),
       ]);
       return Response.json({ ok: true });
     }
