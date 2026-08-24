@@ -1,0 +1,1 @@
+ALTER TABLE `products` ADD `promotion_status` text DEFAULT '正常推广' NOT NULL;
